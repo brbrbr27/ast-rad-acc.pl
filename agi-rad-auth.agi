@@ -1,0 +1,198 @@
+#!/usr/bin/perl 
+#
+# Basically derived from PortaOne's authentication script
+# by Oleksandr Kapitanenko
+# (http://www.voip-info.org/tiki-index.php?page=PortaOne+Radius+auth)
+#
+# AGI RADIUS client
+# (c) LANBilling (www.lanbilling.ru)
+# by Murashkin Artem <murashkin@lanbilling.ru>
+#
+
+use Crypt::CBC;
+use Asterisk::AGI;
+use Authen::Radius;
+use Digest::MD5 qw(md5_hex);
+
+my $return_code;
+
+my $credit_time = -1;
+my $timeout = -1;
+my $credit_amount;
+my $hangup = 1;
+my $call_setup = 1;
+
+$AGI = new Asterisk::AGI;
+my %input = $AGI->ReadParse();
+
+$AGI->verbose("AGI Environment Dump:", 3);
+foreach my $i (sort keys %input) {
+        $AGI->verbose(" -- $i = $input{$i}", 3);
+}
+
+         
+
+my %params;
+my(@pairs) = split(/[&;]/,$ARGV[0]);
+my($param,$value);
+foreach (@pairs) {
+	($param,$value) = split('=',$_,2);
+	$param = unescape($param);
+	$value = unescape($value);
+	$params{$param}=$value;
+}
+
+$hangup = 0 if defined $params{'IfFailed'} && $params{'IfFailed'} =~ /DoNotHangup/i;
+
+my $r = new Authen::Radius(Host => $AGI->get_variable('RADIUS_Server')."\:".$AGI->get_variable('RADIUS_Auth_Port'), Secret => $AGI->get_variable('RADIUS_Secret'));
+if( !defined $r ) {
+        $AGI->verbose('RADIUS server "'.$AGI->get_variable('RADIUS_Server').'" ERROR', 3);
+        $AGI->hangup() if $hangup;
+        exit;
+}
+
+Authen::Radius->load_dictionary;
+
+$input{'dnid'} = $input{'extension'};
+my $dnid = $1 if $AGI->get_variable('DNID2') =~ /(\d+)/;
+
+$AGI->set_variable('DNID',$input{'dnid'});
+$input{'callerid'} = $1 if defined $input{'callerid'}  && $input{'callerid'} =~ /<(\d*)>/;
+$params{'Mode'} = 'Account' unless defined $params{'Mode'};
+
+my $confid = uc(md5_hex($input{'channel'}));
+$confid =~ s/(\w{8})(\w{8})(\w{8})(\w{8})/$1 $2 $3 $4/;
+
+$r->add_attributes (
+	{ Name => 'NAS-IP-Address', Value => $AGI->get_variable('NAS_IP_Address') },
+        { Name => 'NAS-Port-Name', Value => $input{'channel'} },
+        { Name => 'Cisco-AVPair', Value => "call-id=$input{'uniqueid'}" }        
+);
+
+$r->add_attributes (
+          { Name => 'Calling-Station-Id', Value => $input{'callerid'} },
+          { Name => 'Called-Station-Id', Value => $dnid },
+          { Name => 'h323-conf-id', Value => $confid }
+) unless $params{'Mode'} =~ /AuthOnly/i;
+
+my $UserName;
+if( $params{'Mode'} =~ /sip/i ) {
+	my $sip_auth_header = $AGI->get_variable('SIP_Authorization');
+        if( !defined $sip_auth_header ) {
+                $AGI->verbose("ERROR Authorization=SIP requested but no SIP Authorization header provided.", 3);
+		$AGI->set_variable('RADIUS_Status', 'ConfigurationError');
+                $AGI->hangup() if $hangup;
+                exit;
+        }
+
+        $sip_auth_header =~ s/\s*Digest\s*//;
+        my %sip_auth;
+        my(@pairs) = split(/[,]/,$sip_auth_header);
+        my($param,$value);
+        
+        
+        foreach (@pairs) {
+                ($param,$value) = split('=',$_,2);
+                $param = unescape($param);
+                $value = unescape($value);
+                $value =~ s/^"//;
+                $value =~ s/"$//;
+                $value =~ s/^ +//;
+                $param =~ s/^ +//;
+                $sip_auth{$param}=$value;
+                
+                
+        }
+        
+        
+	
+	$UserName = $sip_auth{'username'};
+	$r->add_attributes ( { Name => 'User-Name', Value => $UserName } );
+	$r->add_attributes ( { Name => 'Digest-Attributes', Value => 'User-Name = "'.$sip_auth{'username'}.'"' } );
+	$r->add_attributes ( { Name => 'Digest-Attributes', Value => 'Realm = "'.$sip_auth{'realm'}.'"' } );
+	$r->add_attributes ( { Name => 'Digest-Attributes', Value => 'Nonce = "'.$sip_auth{'nonce'}.'"' } );
+	$r->add_attributes ( { Name => 'Digest-Attributes', Value => 'URI = "'.$sip_auth{'uri'}.'"' } );
+	$r->add_attributes ( { Name => 'Digest-Attributes', Value => 'Method = "INVITE"' } ); 
+	$r->add_attributes ( { Name => 'Digest-Attributes', Value => 'Algorithm = "'.$sip_auth{'algorithm'}.'"' } );
+	$r->add_attributes ( { Name => 'Digest-Response', Value => $sip_auth{'response'} } );
+	$AGI->set_variable('SIP_Username', $sip_auth{'username'});
+} else {
+	$UserName = $params{'Username'} || 'unknown';
+	$r->add_attributes ( { Name => 'User-Name', Value => $UserName } );
+        $params{'Password'} = '' unless defined $params{'Password'};	
+	$r->add_attributes ( { Name => 'Password', Value => $params{'Password'} } );
+}
+
+
+$r->send_packet (ACCESS_REQUEST) and $type = $r->recv_packet;
+if($r->get_error() != 0) {
+  $AGI->verbose("Radius Error = ".$r->strerror($r->get_error())."\n");
+}
+if( !defined $type ) {
+	$AGI->verbose("No responce from RADIUS server", 3);
+	$AGI->set_variable('RADIUS_Status', 'NoResponce');
+	$AGI->hangup() if $hangup;
+} else {
+if ($type == 2) {
+  $AGI->set_variable('RADIUS_Status', 'ACCEPT');
+} else {
+if ($type == 3) {
+  $AGI->set_variable('RADIUS_Status', 'REJECT');
+} else {
+$AGI->set_variable('RADIUS_Status', $type);
+}}}
+
+$AGI->verbose("RADIUS server response type = \"$type\"", 3);
+my $route;
+for $a ($r->get_attributes) {
+	$AGI->verbose("attr: name=\"$a->{'Name'}\" value=\"$a->{'Value'}\"", 3);
+	$AGI->set_variable($a->{'Name'}, $a->{'Value'});
+        $return_code = $a->{'Value'} if $a->{'Name'} eq 'h323-return-code';
+	$credit_time = $a->{'Value'} if $a->{'Name'} eq 'h323-credit-time';
+	$credit_amount = $a->{'Value'} if $a->{'Name'} eq 'h323-credit-amount';
+	$timeout = $a->{'Value'} if $a->{'Name'} eq 'Session-Timeout';
+	$route = $a->{'Value'} if $a->{'Name'} eq 'xpgk-routing-reply';
+}
+
+if(defined($route))
+{
+  my @rlist = split(/,/,$route);
+  $AGI->set_variable('ROUTE1', $rlist[0]) if defined($rlist[0]) && !($rlist[0] eq '');
+  $AGI->set_variable('ROUTE2', $rlist[1]) if defined($rlist[1]) && !($rlist[1] eq '');
+}
+
+$AGI->hangup() if $return_code != 0 && $return_code != 13 && $hangup;
+
+
+if(($type==3)&&($hangup)){
+  $AGI->hangup();
+}
+
+
+        
+
+
+if ($timeout>0){
+  $AGI->set_autohangup($timeout);
+} else {
+if ($credit_time>0){
+  $AGI->set_autohangup($credit_time);
+}}
+
+
+unless ($params{'Mode'} =~ /AuthOnly/i)
+{
+  $AGI->exec('UserEvent','_SIP_Auth|User-Name:\ '.$UserName."|".'DNID:\ '.$dnid."|".'Channel:\ '.$input{'channel'});
+} 
+
+exit;
+
+# unescape URL-encoded data
+sub unescape {
+    shift() if ref($_[0]);
+    my $todecode = shift;
+    return undef unless defined($todecode);
+    $todecode =~ tr/+/ /;       # pluses become spaces
+    $todecode =~ s/%([0-9a-fA-F]{2})/pack("c",hex($1))/ge;
+    return $todecode;
+}
