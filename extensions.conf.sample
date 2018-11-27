@@ -1,0 +1,43 @@
+[general]
+static=yes
+clearglobalvars=yes
+
+[globals]
+RADIUS_Server=127.0.0.1
+RADIUS_Secret=secret
+RADIUS_Auth_Port=1812
+RAIUS_Acct_Port=1813
+Acct_Update_Timeout=60
+NAS_IP_Address=127.0.0.1
+
+[sip_auth]
+exten => _X.,1,Set(SIP_Authorization=${SIP_HEADER(Proxy-Authorization)})
+exten => _X.,n,AGI(agi-rad-auth.agi|Mode=SIP)
+exten => _X.,n,Goto(default,${EXTENSION},1)
+exten => _X.,n,Hangup()
+
+[zap_auth]
+exten => _X.,1,AGI(agi-rad-auth.agi|Mode=Account&Username=Zap&Password=qqq)
+exten => _X.,n,Goto(default,${EXTEN},1)
+exten => _X.,n,Hangup()
+
+[incoming_auth]
+exten => s,1,SET(DNID2="1234567") ; my office incoming num (if we want to overwrite 's' extension)
+;;;;; Simple ANI-Auth
+exten => s,n,AGI(agi-rad-auth.agi|Mode=Account&IfFailed=DoNotHangup)
+;;;;;
+;;;;; ANI-Auth with tel pin (Password)
+;exten => s,n,AGI(agi-rad-auth.agi|Mode=Account&Password=qwerty&IfFailed=DoNotHangup)
+;;;;;
+exten => s,n,Queue(office|tn|||60)
+exten => s,n,Hangup()
+
+;;;;; Incoming ANI-Auth for SIP-phones. Rejected calls will be dropped.
+exten => _X.,1,AGI(agi-rad-auth.agi|Mode=Account)
+exten => _X.,n,Dial(SIP/${EXTEN})
+exten => _X.,n,Hangup()
+
+[default]
+
+exten => _XXXX.,1,Dial(SIP/${EXTEN}@my.provider.com)
+; ...
